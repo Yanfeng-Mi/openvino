@@ -198,6 +198,17 @@ KERNEL (gather_2d_ref)(
     }
 }
 
+#elif PREFILL_ROUTING_WEIGHT_GATHER_ENABLE
+KERNEL(prefill_routing_weight_gather_ref)(
+    const __global MOE_DTYPE* src_rweight,
+    __global int* top_index,
+    __global MOE_DTYPE* dst_rweight) {
+
+    const int k = get_global_id(0);
+    const int top_idx = top_index[k];
+    dst_rweight[k] = src_rweight[top_idx];
+}
+
 #elif SCATTER_ENABLE
 KERNEL (index_add_)(const __global MOE_DTYPE* src_tok,
     __global int * tok_index,
