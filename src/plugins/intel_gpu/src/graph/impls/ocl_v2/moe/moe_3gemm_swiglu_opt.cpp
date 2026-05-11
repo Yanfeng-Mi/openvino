@@ -10,9 +10,6 @@
 #define DEBUG_MOE_LOG 0
 
 #ifdef ENABLE_ONEDNN_FOR_GPU
-#    include <atomic>
-#    include <cmath>
-#    include <iostream>
 #    include <initializer_list>
 #    include <oneapi/dnnl/dnnl.hpp>
 #    include <sstream>
@@ -40,17 +37,6 @@ namespace ov::intel_gpu::ocl {
 namespace {
 
 using namespace ov::intel_gpu::ocl;
-
-bool is_moe_xe2_plus(const cldnn::device_info& info);
-size_t get_moe_subgroup_size(const cldnn::device_info& info);
-
-size_t get_layout_element_count(const cldnn::layout& layout) {
-    size_t element_count = 1;
-    for (const auto dim : layout.get_shape()) {
-        element_count *= static_cast<size_t>(dim);
-    }
-    return element_count;
-}
 
 dnnl::memory::data_type convert_data_type(cldnn::data_types dt) {
     switch (dt) {
@@ -420,30 +406,7 @@ protected:
         jit.make("HIDDEN_SIZE", desc->_config.hidden_size);
         jit.make("MOE_DTYPE", params.get_input_layout(0).data_type == ov::element::f16 ? "half" : "float");
         jit.make("MOE_DTYPE_SIZE", params.get_input_layout(0).data_type == ov::element::f16 ? 2 : 4);
-        jit.make("SUBGROUP_SIZE", get_moe_subgroup_size(info));
-        return jit;
-    }
-
-    [[nodiscard]] Arguments get_arguments_desc(const RuntimeParams& params) const override {
-        Arguments args;
-
-        return args;
-    }
-
-    [[nodiscard]] DispatchDataFunc get_dispatch_data_func() const override {
-        return DispatchDataFunc{[](const RuntimeParams& params, KernelData& kd, ImplRuntimeParams* rt_params) {}};
-    }
-};
-
-class MoE3GemmSwigluPrefillRoutingWeightGather : public KernelGenerator {
-public:
-    MoE3GemmSwigluPrefillRoutingWeightGather() : KernelGenerator("moe_3gemm_swiglu_fuse", "prefill_routing_weight_gather") {}
-
-protected:
-    [[nodiscard]] JitConstants get_jit_constants(const RuntimeParams& params) const override {
-        auto jit = KernelGenerator::get_jit_constants(params);
-        jit.make("PREFILL_ROUTING_WEIGHT_GATHER_ENABLE", 1);
-        jit.make("MOE_DTYPE", params.get_input_layout(0).data_type == ov::element::f16 ? "half" : "float");
+        jit.make("SUBGROUP_SIZE", info.arch >= gpu_arch::xe2 ? 32 : 16);
         return jit;
     }
 
@@ -492,24 +455,13 @@ protected:
     }
 };
 
-static size_t get_token_count(const cldnn::layout& layout, size_t hidden_size) {
-    OPENVINO_ASSERT(hidden_size > 0, "hidden_size must be positive");
-
-    const auto shape = layout.get_shape();
-    size_t element_count = 1;
-    for (const auto dim : shape) {
-        element_count *= static_cast<size_t>(dim);
+static size_t get_seq_len(cldnn::layout& layout) {
+    auto shape = layout.get_shape();
+    size_t seq_len = static_cast<size_t>(shape[0]);
+    if (shape.size() >= 3) {
+        seq_len = static_cast<size_t>(shape[0] * shape[1]);
     }
-
-    OPENVINO_ASSERT(element_count % hidden_size == 0,
-                    "Unexpected hidden_states layout for MoE input: layout=",
-                    layout.to_short_string(),
-                    ", element_count=",
-                    element_count,
-                    ", hidden_size=",
-                    hidden_size);
-
-    return element_count / hidden_size;
+    return seq_len;
 }
 
 static size_t get_vec_size(const RuntimeParams& params) {
@@ -614,7 +566,7 @@ protected:
         const auto& info = engine.get_device_info();
 
         jit.make("PREFILL_SWIGLU_ENABLE", 1);
-        jit.make("SUBGROUP_SIZE", get_moe_subgroup_size(info));
+        jit.make("SUBGROUP_SIZE", info.arch >= gpu_arch::xe2 ? 32 : 16);
         jit.make("INTERMEDIA_SIZE", desc->_config.inter_size);
         jit.make("MOE_DTYPE", "half");
         return jit;
@@ -723,7 +675,7 @@ static void add_common_consts(const RuntimeParams& params, JitConstants& jit) {
     jit.make("HIDDEN_SIZE", desc->_config.hidden_size);
     jit.make("INTERMEDIATE_SIZE", desc->_config.inter_size);
     jit.make("N_BLOCK", N_BLOCK);
-    jit.make("SUBGROUP_SIZE", get_moe_subgroup_size(info));
+    jit.make("SUBGROUP_SIZE", info.arch >= gpu_arch::xe2 ? 32 : 16);
     jit.make("SUBGROUP_NUM", SUBGROUP_NUM);
     jit.make("GATE_UP_GROUP_SIZE", gate_up_group_size);
     jit.make("DOWN_GROUP_SIZE", down_group_size);
@@ -823,45 +775,6 @@ dnnl::memory convert2dnnl(const memory::ptr& ptr, const std::vector<int64_t>& di
     return ptr->get_onednn_memory(dnnl::memory::desc(dnnl::memory::dims(dim), convert_data_type(ptr->get_layout().data_type), tag), offset);
 }
 
-bool is_moe_xe2_plus(const cldnn::device_info& info) {
-    return info.arch >= gpu_arch::xe2;
-}
-
-size_t get_moe_subgroup_size(const cldnn::device_info& info) {
-    return is_moe_xe2_plus(info) ? 32 : 16;
-}
-
-void validate_prefill_routing_weight_gather_types(const memory::ptr& src_rweight, const memory::ptr& dst_rweight) {
-    const auto src_type = src_rweight->get_layout().data_type;
-    const auto dst_type = dst_rweight->get_layout().data_type;
-    OPENVINO_ASSERT(src_type == dst_type,
-                    "Unexpected data type mismatch for MoE routing-weight gather: src_type=",
-                    src_type,
-                    ", dst_type=",
-                    dst_type);
-}
-
-void validate_prefill_routing_weight_indices(const std::vector<int>& topk_indices, int total_token_num, int top_k) {
-    OPENVINO_ASSERT(total_token_num >= 0, "total_token_num must be non-negative");
-    OPENVINO_ASSERT(top_k > 0, "top_k must be positive");
-
-    const auto valid_routing_count = static_cast<size_t>(total_token_num) * static_cast<size_t>(top_k);
-    for (size_t token_offset = 0; token_offset < topk_indices.size(); ++token_offset) {
-        const auto top_idx = topk_indices[token_offset];
-        OPENVINO_ASSERT(top_idx >= 0 && static_cast<size_t>(top_idx) < valid_routing_count,
-                        "MoE prefill routing-weight index out of range: top_idx=",
-                        top_idx,
-                        ", token_offset=",
-                        token_offset,
-                        ", valid_routing_count=",
-                        valid_routing_count,
-                        ", total_token_num=",
-                        total_token_num,
-                        ", top_k=",
-                        top_k);
-    }
-}
-
 static bool use_micro_gemm_prefill;
 static bool use_gpu_mask_gen_prefill;
 class moe_3gemm_swiglu_opt_impl : public PrimitiveImplOCL {
@@ -874,7 +787,6 @@ public:
     Stage::Ptr mlp_gate_up = make_stage<MoE3GemmSwigluMLPGateUp>();
     Stage::Ptr mlp_down = make_stage<MoE3GemmSwigluMLPDown>();
     Stage::Ptr mlp_reduce = make_stage<MoE3GemmSwigluMLPReduce>();
-    Stage::Ptr prefill_routing_weight_gather = make_stage<MoE3GemmSwigluPrefillRoutingWeightGather>();
 
     Stage::Ptr prefill_gather = make_stage<MoE3GemmSwigluPrefillGather>();
     Stage::Ptr micro_gemm_gate = make_stage<MoE3GemmMicroGenerator>(MoE3GemmMicroKernelType::MLP_GATE);
@@ -971,7 +883,7 @@ public:
         auto& engine = params.prog->get_engine();
         const auto& info = engine.get_device_info();
         // FIXME: CVS-182236 Prefill performance on discrete GPU is bad when using micro_gemm_prefill, need to investigate further, disable it for now.
-        if (!is_moe_xe2_plus(info) || info.dev_type == cldnn::device_type::discrete_gpu) {
+        if (info.arch < gpu_arch::xe2 || info.dev_type == cldnn::device_type::discrete_gpu) {
             use_micro_gemm_prefill = false;
             GPU_DEBUG_TRACE_DETAIL << "[DEBUG] moe_3gemm_swiglu_opt_impl(): use_micro_gemm_prefill=" << use_micro_gemm_prefill
                                    << ", arch=" << static_cast<int>(info.arch) << std::endl;
@@ -1000,7 +912,6 @@ public:
         add_stage(mlp_gate_up, params);
         add_stage(mlp_down, params);
         add_stage(mlp_reduce, params);
-        add_stage(prefill_routing_weight_gather, params);
         if (use_micro_gemm_prefill) {
             add_stage(prefill_mask_gen, params);
             add_stage(prefill_gather, params);
@@ -1107,7 +1018,7 @@ public:
         size_t max_topk = static_cast<size_t>(config.top_k);
         size_t expert_num = static_cast<size_t>(config.num_expert);
         auto hidden_states_layout = params.input_layouts[0];
-        auto token_num = get_token_count(hidden_states_layout, static_cast<size_t>(config.hidden_size));
+        auto token_num = get_seq_len(hidden_states_layout);
         auto data_type = hidden_states_layout.data_type;
 
         std::vector<BufferDescriptor> internal_buffers;
@@ -1194,17 +1105,14 @@ public:
         scratch.moe_fusion_wei_addr.zp[2] = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::ZP_2));
     }
 
-    void get_expert_mask_from_gpu(const MOE3GemmFusedCompressed::Config& config,
-                                  memory::ptr mem,
-                                  size_t actual_token_count,
-                                  stream& stream,
-                                  expert_mask_cpu& expert_mask) {
+    void get_expert_mask_from_gpu(const MOE3GemmFusedCompressed::Config& config, memory::ptr mem, stream& stream, expert_mask_cpu& expert_mask) {
         // shape: [token_num, topk]
         auto layout = mem->get_layout();
+        const auto& shape = layout.get_shape();
 
         int max_expert_num = static_cast<int>(config.num_expert);
         int max_topk = static_cast<int>(config.top_k);
-        int max_tokens = static_cast<int>(actual_token_count);
+        int max_tokens = static_cast<int>(shape[0]);
 
         expert_mask.pred_flag.resize(max_expert_num, 0);
         expert_mask.batch.resize(max_expert_num, {});
@@ -1340,7 +1248,7 @@ public:
         _hidden_size = static_cast<int>(cur_moe->_config.hidden_size);
         _intermediate_size = static_cast<int>(cur_moe->_config.inter_size);
 
-        const size_t subgroup_size = get_moe_subgroup_size(instance.get_impl_params()->get_device_info());
+        const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
         const size_t max_work_group_size = instance.get_impl_params()->get_device_info().max_work_group_size;
 
         // gate
@@ -1405,13 +1313,13 @@ public:
         auto batch_mem_ptr = scratch.topk_id;
         auto [hidden_states_mem_ptr, hidden_states_layout] = get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
         auto routing_mem_ptr = scratch.topk_weights;
-        auto token_num = get_token_count(hidden_states_layout, static_cast<size_t>(config.hidden_size));
+        auto token_num = get_seq_len(hidden_states_layout);
 
         _hidden_size = static_cast<int>(cur_moe->_config.hidden_size);
         _intermediate_size = static_cast<int>(cur_moe->_config.inter_size);
 
         auto rtp = static_cast<MoE3GemmRuntimeParams*>(m_rt_params.get());
-        const size_t subgroup_size = get_moe_subgroup_size(instance.get_impl_params()->get_device_info());
+        const size_t subgroup_size = instance.get_impl_params()->get_device_info().arch >= gpu_arch::xe2 ? 32 : 16;
 
         event::ptr ret_event;
         const auto& intermediates_memories = instance.get_intermediates_memories();
@@ -1454,7 +1362,7 @@ public:
         } else {
             ret_event = events.empty() ? nullptr : events[0];
             expert_mask_cpu expert_mask_cpu;
-            get_expert_mask_from_gpu(config, batch_mem_ptr, token_num, stream, expert_mask_cpu);
+            get_expert_mask_from_gpu(config, batch_mem_ptr, stream, expert_mask_cpu);
 
             auto token_size = token_num;
             auto max_topk = static_cast<int>(cur_moe->_config.top_k);
@@ -1782,12 +1690,12 @@ public:
             OPENVINO_THROW("hidden_size=", hidden_size, " is not divisible by any of ", sizeof(candidate) / sizeof(size_t), " candidates");
         };
         auto lws_size = get_best_lws(_hidden_size);
-        const auto token_num = static_cast<int>(get_token_count(hidden_states_layout, static_cast<size_t>(config.hidden_size)));
+        auto max_topk = static_cast<int64_t>(config.top_k);
+
         // [batch, max_topk]
         auto topk_id_mem = scratch.topk_id;
         expert_mask_cpu expert_mask;
-        get_expert_mask_from_gpu(config, topk_id_mem, static_cast<size_t>(token_num), stream, expert_mask);
-        validate_prefill_routing_weight_gather_types(routing_mem_ptr, scratch.routing_weights);
+        get_expert_mask_from_gpu(config, topk_id_mem, stream, expert_mask);
 
         for (size_t expert_no = 0; expert_no < config.num_expert; expert_no++) {
             if (expert_no >= expert_mask.pred_flag.size()) {
@@ -1798,22 +1706,18 @@ public:
                 continue;
             }
             auto& dnnl_weights = _dnnl_weights[expert_no];
-            const auto& topk_indices = expert_mask.topk[expert_no];
 
             // expert_mask
             expert_mask_gpu& expert_mask_mem = scratch.expert_masks[expert_no];
-
-            auto n_token = static_cast<int>(expert_mask.batch[expert_no].size());
-            OPENVINO_ASSERT(topk_indices.size() == static_cast<size_t>(n_token),
-                            "Unexpected MoE prefill routing-weight gather index count: topk_indices=",
-                            topk_indices.size(),
-                            ", n_token=",
-                            n_token,
-                            ", expert_no=",
-                            expert_no);
-            validate_prefill_routing_weight_indices(topk_indices, token_num, static_cast<int>(config.top_k));
             copy_expert_mask_to_gpu(stream, expert_mask, expert_no, expert_mask_mem);
 
+            auto n_token = static_cast<int>(expert_mask.batch[expert_no].size());
+
+            // Be careful about possible overflow
+            if (n_token > std::numeric_limits<int64_t>::max() / max_topk)
+                OPENVINO_THROW("n_token * max_topk overflow detected, n_token=", n_token, " max_topk=", max_topk);
+
+            int64_t routing_weights_size = static_cast<int64_t>(n_token * max_topk);
             onednn_kernel& kernel = get_kernel(n_token, static_cast<int>(expert_no), instance);
 
             // gather
@@ -1824,14 +1728,6 @@ public:
                                          {scratch.x, scratch.routing_weights},
                                          {static_cast<size_t>(n_token), static_cast<size_t>(_hidden_size)},
                                          {1, lws_size},
-                                         instance.needs_completion_event());
-            result_event = execute_stage({result_event},
-                                         instance,
-                                         *prefill_routing_weight_gather,
-                                         {routing_mem_ptr, expert_mask_mem.topk},
-                                         {scratch.routing_weights},
-                                         {static_cast<size_t>(n_token)},
-                                         {1},
                                          instance.needs_completion_event());
 
             // up
@@ -1853,7 +1749,7 @@ public:
                                 n_token,
                                 convert2dnnl(scratch.gate, {static_cast<int64_t>(n_token), _intermediate_size}, dnnl::memory::format_tag::ab),
                                 convert2dnnl(scratch.y, {static_cast<int64_t>(n_token), _hidden_size}, dnnl::memory::format_tag::ab),
-                                convert2dnnl(scratch.routing_weights, {static_cast<int64_t>(n_token), 1}, dnnl::memory::format_tag::ab));
+                                convert2dnnl(scratch.routing_weights, {static_cast<int64_t>(routing_weights_size)}, dnnl::memory::format_tag::a));
 
             // index_add
             result_event = execute_stage({result_event},
@@ -1879,8 +1775,7 @@ public:
         cldnn::event::ptr ret_env = nullptr;
 
         auto [hidden_states_mem_ptr, hidden_states_layout] = get_input_info(instance, static_cast<size_t>(MOE3GemmInputIndex::HIDDEN_STATES));
-        auto router_logits_mem_ptr = instance.input_memory_ptr(static_cast<size_t>(MOE3GemmInputIndex::ROUTING_WEIGHTS));
-        size_t token_num = get_token_count(hidden_states_layout, static_cast<size_t>(config.hidden_size));
+        size_t token_num = get_seq_len(hidden_states_layout);
         scratch_buffers scratch;
         prepare_internal_buffers(instance, scratch, token_num);
 
